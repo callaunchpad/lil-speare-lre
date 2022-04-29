@@ -19,6 +19,25 @@ def log_prob(z, mu, logvar):
 def loss_kl(mu, logvar):
     return -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / len(mu)
 
+class Classifier(nn.Module):
+
+    def __init__(self, args):
+        super().__init__()
+        
+        self.l1 = torch.nn.Linear(args.dim_z, 64)
+        self.l2 = torch.nn.Linear(64, 32)
+        self.l3 = torch.nn.Linear(32, 16)
+        self.l4 = torch.nn.Linear(16, 4)
+        self.l5 = torch.nn.Linear(4, 1)
+
+
+    def forward(self, x):
+       z1 = torch.relu(self.l1(x))
+       z2 = torch.relu(self.l2(z1))
+       z3 = torch.relu(self.l3(z2))
+       z4 = torch.relu(self.l4(z3))
+       z5 = torch.sigmoid(self.l5(z4))
+       return z5
 
 class TextModel(nn.Module):
     """Container module with word embedding and projection layers"""

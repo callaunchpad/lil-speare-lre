@@ -6,7 +6,7 @@ import collections
 import numpy as np
 import torch
 
-from model import DAE, VAE, AAE
+from model import DAE, VAE, AAE, Classifier
 from vocab import Vocab
 from meter import AverageMeter
 from utils import set_seed, logging, load_sent
@@ -55,7 +55,7 @@ parser.add_argument('--lr', type=float, default=0.0005, metavar='LR',
                     help='learning rate')
 #parser.add_argument('--clip', type=float, default=0.25, metavar='NORM',
 #                    help='gradient clipping')
-parser.add_argument('--epochs', type=int, default=50, metavar='N',
+parser.add_argument('--epochs', type=int, default=100, metavar='N',
                     help='number of training epochs')
 parser.add_argument('--batch-size', type=int, default=256, metavar='N',
                     help='batch size')
@@ -71,7 +71,7 @@ def evaluate(model, batches):
     model.eval()
     meters = collections.defaultdict(lambda: AverageMeter())
     with torch.no_grad():
-        for inputs, targets in batches:
+        for inputs, targets, _ in batches:
             losses = model.autoenc(inputs, targets)
             for k, v in losses.items():
                 meters[k].update(v.item(), inputs.size(1))
@@ -89,9 +89,11 @@ def main(args):
     train_sents = load_sent(args.train)
     logging('# train sents {}, tokens {}'.format(
         len(train_sents), sum(len(s) for s in train_sents)), log_file)
+
     valid_sents = load_sent(args.valid)
     logging('# valid sents {}, tokens {}'.format(
         len(valid_sents), sum(len(s) for s in valid_sents)), log_file)
+
     vocab_file = os.path.join(args.save_dir, 'vocab.txt')
     if not os.path.isfile(vocab_file):
         Vocab.build(train_sents, vocab_file, args.vocab_size)
@@ -103,54 +105,90 @@ def main(args):
     device = torch.device('cuda' if cuda else 'cpu')
     model = {'dae': DAE, 'vae': VAE, 'aae': AAE}[args.model_type](
         vocab, args).to(device)
+
+    train_batches, _ = get_batches(train_sents, vocab, args.batch_size, device)
+    valid_batches, _ = get_batches(valid_sents, vocab, args.batch_size, device)
+
     if args.load_model:
         ckpt = torch.load(args.load_model)
         model.load_state_dict(ckpt['model'])
         model.flatten()
-    logging('# model parameters: {}'.format(
-        sum(x.data.nelement() for x in model.parameters())), log_file)
+    else:
+        logging('# model parameters: {}'.format(
+            sum(x.data.nelement() for x in model.parameters())), log_file)
 
-    train_batches, _ = get_batches(train_sents, vocab, args.batch_size, device)
-    valid_batches, _ = get_batches(valid_sents, vocab, args.batch_size, device)
-    best_val_loss = None
+        best_val_loss = None
+        for epoch in range(args.epochs):
+            start_time = time.time()
+            logging('-' * 80, log_file)
+            model.train()
+            meters = collections.defaultdict(lambda: AverageMeter())
+            indices = list(range(len(train_batches)))
+            random.shuffle(indices)
+            for i, idx in enumerate(indices):
+                inputs, targets, _ = train_batches[idx]
+                losses = model.autoenc(inputs, targets, is_train=True)
+                losses['loss'] = model.loss(losses)
+                model.step(losses)
+                for k, v in losses.items():
+                    meters[k].update(v.item())
+
+                if (i + 1) % args.log_interval == 0:
+                    log_output = '| epoch {:3d} | {:5d}/{:5d} batches |'.format(
+                        epoch + 1, i + 1, len(indices))
+                    for k, meter in meters.items():
+                        log_output += ' {} {:.2f},'.format(k, meter.avg)
+                        meter.clear()
+                    logging(log_output, log_file)
+
+            valid_meters = evaluate(model, valid_batches)
+            logging('-' * 80, log_file)
+            log_output = '| end of epoch {:3d} | time {:5.0f}s | valid'.format(
+                epoch + 1, time.time() - start_time)
+            for k, meter in valid_meters.items():
+                log_output += ' {} {:.2f},'.format(k, meter.avg)
+            if not best_val_loss or valid_meters['loss'].avg < best_val_loss:
+                log_output += ' | saving model'
+                ckpt = {'args': args, 'model': model.state_dict()}
+                torch.save(ckpt, os.path.join(args.save_dir, 'model.pt'))
+                best_val_loss = valid_meters['loss'].avg
+            logging(log_output, log_file)
+        logging('Done training base model', log_file)
+
+    classifier = Classifier(args).to(device)
+    loss_func = torch.nn.BCELoss()
+    optimizer = torch.optim.Adam(classifier.parameters(), lr=0.01)
     for epoch in range(args.epochs):
-        start_time = time.time()
-        logging('-' * 80, log_file)
+        model.requires_grad = False
         model.train()
-        meters = collections.defaultdict(lambda: AverageMeter())
+        classifier.train()
+
         indices = list(range(len(train_batches)))
         random.shuffle(indices)
+
+        losses = []
+
         for i, idx in enumerate(indices):
-            inputs, targets = train_batches[idx]
-            losses = model.autoenc(inputs, targets, is_train=True)
-            losses['loss'] = model.loss(losses)
-            model.step(losses)
-            for k, v in losses.items():
-                meters[k].update(v.item())
+            inputs, _, targets = train_batches[idx]
 
-            if (i + 1) % args.log_interval == 0:
-                log_output = '| epoch {:3d} | {:5d}/{:5d} batches |'.format(
-                    epoch + 1, i + 1, len(indices))
-                for k, meter in meters.items():
-                    log_output += ' {} {:.2f},'.format(k, meter.avg)
-                    meter.clear()
-                logging(log_output, log_file)
+            z, _ = model.encode(inputs)
+            y = classifier.forward(z)
+            loss = loss_func(y, targets.T.float())
 
-        valid_meters = evaluate(model, valid_batches)
-        logging('-' * 80, log_file)
-        log_output = '| end of epoch {:3d} | time {:5.0f}s | valid'.format(
-            epoch + 1, time.time() - start_time)
-        for k, meter in valid_meters.items():
-            log_output += ' {} {:.2f},'.format(k, meter.avg)
-        if not best_val_loss or valid_meters['loss'].avg < best_val_loss:
-            log_output += ' | saving model'
-            ckpt = {'args': args, 'model': model.state_dict()}
-            torch.save(ckpt, os.path.join(args.save_dir, 'model.pt'))
-            best_val_loss = valid_meters['loss'].avg
-        logging(log_output, log_file)
-    logging('Done training', log_file)
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+
+            losses.append(loss.item())
+
+        print(np.array(losses).mean())
+        
+        ckpt = {'args': args, 'model': classifier.state_dict()}
+        torch.save(ckpt, os.path.join(args.save_dir, 'classifier.pt'))
 
 if __name__ == '__main__':
+    os.environ['CUDA_VISIBLE_DEVICES'] = '5,6'
+
     args = parser.parse_args()
     args.noise = [float(x) for x in args.noise.split(',')]
     main(args)

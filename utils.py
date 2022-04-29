@@ -1,6 +1,7 @@
 import random
 import numpy as np
 import torch
+import json
 
 def set_seed(seed):     # set the random seed for reproducibility
     random.seed(seed)
@@ -15,7 +16,9 @@ def load_sent(path):
     sents = []
     with open(path) as f:
         for line in f:
-            sents.append(line.split())
+            sent = json.loads(line)
+            sent['text'] = sent['text'].split()
+            sents.append(sent)
     return sents
 
 def write_sent(sents, path):

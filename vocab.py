@@ -17,12 +17,11 @@ class Vocab(object):
         self.eos = self.word2idx['<eos>']
         self.unk = self.word2idx['<unk>']
         self.blank = self.word2idx['<blank>']
-        self.nspecial = 5
 
     @staticmethod
     def build(sents, path, size):
         v = ['<pad>', '<go>', '<eos>', '<unk>', '<blank>']
-        words = [w for s in sents for w in s]
+        words = [w for s in sents for w in s['text']]
         cnt = Counter(words)
         n_unk = len(words)
         for w, c in cnt.most_common(size):
